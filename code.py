@@ -3,7 +3,9 @@ import pandas as pd
 import plotly.express as px
 import datetime
 from PIL import Image
-import os
+import json
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 # 💡 AIで画像を解析するためのライブラリ
 try:
@@ -12,15 +14,39 @@ except ImportError:
     genai = None
 
 st.set_page_config(page_title="AIカロリー管理ダッシュボード", layout="wide")
-st.title("📸 AIカロリー管理ダッシュボード 🏃‍♀️")
+st.title("📸 AIカロリー管理ダッシュボード（スプレッドシート連携版） 🏃‍♀️")
 
-# --- 1. CSVデータの読み書き設定 ---
-CSV_FILE = "calorie_history.csv"
+# --- 1. Googleスプレッドシート接続設定（Secretsから読み込み） ---
+@st.cache_resource
+def init_gspread():
+    try:
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        
+        # StreamlitのSecretsからJSONデータを直接読み込む（ファイル不要！）
+        if "gcp_service_account_json" in st.secrets:
+            account_info = json.loads(st.secrets["gcp_service_account_json"])
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(account_info, scope)
+        else:
+            st.error("Secretsに gcp_service_account_json が設定されてへんよ！")
+            return None
+            
+        client = gspread.authorize(creds)
+        spreadsheet_id = st.secrets["SPREADSHEET_ID"]
+        sheet = client.open_by_key(spreadsheet_id).sheet1
+        return sheet
+    except Exception as e:
+        st.error(f"スプレッドシートの接続に失敗したで: {e}")
+        return None
+
+sheet = init_gspread()
 
 def load_data():
-    if os.path.exists(CSV_FILE):
-        df = pd.read_csv(CSV_FILE)
+    if sheet is not None:
+        data = sheet.get_all_records()
+        df = pd.DataFrame(data)
         columns = ["日付", "体重", "食べたもの", "摂取カロリー", "運動カロリー", "基礎代謝", "カロリー収支"]
+        if df.empty:
+            return pd.DataFrame(columns=columns)
         for col in columns:
             if col not in df.columns:
                 df[col] = ""
@@ -28,8 +54,7 @@ def load_data():
             df["日付"] = pd.to_datetime(df["日付"], format='mixed', errors='coerce')
         return df
     else:
-        columns = ["日付", "体重", "食べたもの", "摂取カロリー", "運動カロリー", "基礎代謝", "カロリー収支"]
-        return pd.DataFrame(columns=columns)
+        return pd.DataFrame(columns=["日付", "体重", "食べたもの", "摂取カロリー", "運動カロリー", "基礎代謝", "カロリー収支"])
 
 df = load_data()
 
@@ -63,7 +88,6 @@ with col1:
 with col2:
     st.write("🍔 食事の写真をアップロードしてAI推定！")
     
-    # SecretsからAPIキーを安全に取得
     try:
         api_key = st.secrets["GEMINI_API_KEY"]
     except Exception:
@@ -126,28 +150,32 @@ if st.button("💾 記録を保存する"):
     balance = food_kcal - (bmr + exercise_kcal)
     date_str = pd.to_datetime(record_date).strftime('%Y-%m-%d')
     
-    new_data = pd.DataFrame([{
-        "日付": date_str,
-        "体重": current_weight,
-        "食べたもの": food_memo,
-        "摂取カロリー": food_kcal,
-        "運動カロリー": exercise_kcal,
-        "基礎代謝": bmr,
-        "カロリー収支": balance
-    }])
-    
-    if os.path.exists(CSV_FILE):
-        saved_df = pd.read_csv(CSV_FILE)
-        saved_df = saved_df[saved_df["日付"] != date_str]
-        saved_df = pd.concat([saved_df, new_data], ignore_index=True)
-    else:
-        saved_df = new_data
+    if sheet is not None:
+        rows = sheet.get_all_values()
+        if not rows:
+            sheet.append_row(["日付", "体重", "食べたもの", "摂取カロリー", "運動カロリー", "基礎代謝", "カロリー収支"])
+            rows = sheet.get_all_values()
+            
+        row_to_update = None
+        for i, row in enumerate(rows[1:], start=2):
+            if len(row) > 0 and row[0] == date_str:
+                row_to_update = i
+                break
+                
+        new_row_data = [date_str, current_weight, food_memo, food_kcal, exercise_kcal, bmr, balance]
         
-    saved_df.to_csv(CSV_FILE, index=False)
-    st.success("🎉 CSVに記録を保存したで！")
-    st.session_state.ai_kcal = 0
-    st.session_state.ai_comment = ""
-    st.rerun()
+        if row_to_update:
+            for col_idx, val in enumerate(new_row_data, start=1):
+                sheet.update_cell(row_to_update, col_idx, val)
+        else:
+            sheet.append_row(new_row_data)
+            
+        st.success("🎉 スプレッドシートに記録を保存したで！")
+        st.session_state.ai_kcal = 0
+        st.session_state.ai_comment = ""
+        st.rerun()
+    else:
+        st.error("スプレッドシートに接続されてへんから保存できへんかったわ！")
 
 # --- 4. グラフ推移確認 ---
 st.markdown("---")
@@ -196,7 +224,7 @@ if not df.empty and "日付" in df.columns:
         fig_weight.update_xaxes(type='category')
         st.plotly_chart(fig_weight, width="stretch")
 else:
-    st.info("💡 記録が入ったら、ここにグラフが表示されるで！")
+    st.info("💡 スプレッドシートにデータが入ったら、ここにグラフが表示されるで！")
 
 # --- 5. 日々の記録一覧テーブル ---
 st.markdown("---")
