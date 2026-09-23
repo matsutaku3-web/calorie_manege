@@ -65,7 +65,7 @@ with col1:
 with col2:
     st.write("🍔 食事の写真をアップロードしてAI推定！")
     
-    api_key = "AIzaSyDq3mHXQxUEI_-J2V4_0gkMWKh15vqC8kI"
+    api_key = st.secrets["GEMINI_API_KEY"]
     
     uploaded_file = st.file_uploader("食事の写真を選ぶ", type=["jpg", "jpeg", "png"])
     
