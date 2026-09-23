@@ -23,7 +23,6 @@ def load_data():
         df = pd.read_csv(CSV_FILE)
         if not df.empty and "日付" in df.columns:
             df["日付"] = pd.to_datetime(df["日付"], format='mixed', errors='coerce')
-        # 💡 列が足りない古いCSV対策（食べたものカラムを追加）
         if "食べたもの" not in df.columns:
             df["食べたもの"] = ""
     else:
@@ -57,7 +56,6 @@ with col1:
     record_date = st.date_input("日付", datetime.date.today())
     current_weight = st.number_input("今日の体重 (kg)", value=weight, step=0.1)
     
-    # 💡【新機能】食べたもののメモ欄
     food_memo = st.text_input("食べたもの（例: 豚骨ラーメン、プロテインなど）", value="")
     
     exercise_kcal = st.number_input("運動の消費カロリー (kcal) ※ランニングなど", value=0, step=10)
@@ -65,12 +63,18 @@ with col1:
 with col2:
     st.write("🍔 食事の写真をアップロードしてAI推定！")
     
-    api_key = st.secrets["GEMINI_API_KEY"]
+    # 🔑 Streamlit CloudのSecretsから安全にAPIキーを取得（ローカルの場合は環境変数等にあわせて適宜）
+    try:
+        api_key = st.secrets["GEMINI_API_KEY"]
+    except:
+        api_key = "AIzaSyDq3mHXQxUEI_-J2V4_0gkMWKh15vqC8kI" # 予備
     
     uploaded_file = st.file_uploader("食事の写真を選ぶ", type=["jpg", "jpeg", "png"])
     
     if "ai_kcal" not in st.session_state:
         st.session_state.ai_kcal = 0
+    if "ai_comment" not in st.session_state:
+        st.session_state.ai_comment = ""
     
     food_kcal = st.number_input("摂取カロリー (kcal)", value=st.session_state.ai_kcal, step=10)
 
@@ -82,17 +86,45 @@ with col2:
                 image = Image.open(uploaded_file)
                 st.image(image, width=300)
                 
-                with st.spinner("AIがカロリーを計算中..."):
-                    prompt = "この食事の写真を見て、おおよその総摂取カロリー（kcal）を推定して。説明は不要なので、推定した数字だけを返して。（例: 650）"
+                with st.spinner("AIが食事を分析中..."):
+                    # 💡 変更：数字だけでなく、内訳の解説文もセットで返してもらうプロンプトに変更！
+                    prompt = """
+                    この食事の写真を見て、以下の2点を教えてください。
+                    1. 推定される総摂取カロリーの数字（半角数字のみ、例: 800）
+                    2. 何が何kcalくらいか、およびその内訳の簡単な解説（日本語で3〜4行程度）
+
+                    出力形式は必ず以下のようにしてください：
+                    ---CAL--
+                    [総カロリーの数字]
+                    ---COM--
+                    [解説コメント]
+                    """
                     response = model.generate_content([prompt, image])
+                    text_res = response.text
                     
-                    estimated_kcal = int(''.join(filter(str.isdigit, response.text)))
+                    # 応答をパース（分割）する処理
+                    if "---CAL--" in text_res and "---COM--" in text_res:
+                        parts = text_res.split("---COM--")
+                        cal_part = parts[0].replace("---CAL--", "").strip()
+                        comment_part = parts[1].strip()
+                        
+                        estimated_kcal = int(''.join(filter(str.isdigit, cal_part)))
+                        st.session_state.ai_kcal = estimated_kcal
+                        st.session_state.ai_comment = comment_part
+                    else:
+                        # 万が一形式が崩れた場合のフォールバック
+                        estimated_kcal = int(''.join(filter(str.isdigit, text_res)))
+                        st.session_state.ai_kcal = estimated_kcal
+                        st.session_state.ai_comment = text_res
                     
-                    st.session_state.ai_kcal = estimated_kcal
-                    st.success(f"推定摂取カロリー: {estimated_kcal} kcal やで！下の欄に入力しといたわ！")
+                    st.success(f"推定摂取カロリー: {st.session_state.ai_kcal} kcal やで！")
                     st.rerun()
             except Exception as e:
                 st.error(f"画像解析でエラーが出ちゃったわ: {e}")
+
+    # 💡 AIの解説コメントがある場合は画面に表示する
+    if st.session_state.ai_comment:
+        st.info(f"💡 **AIの判定内訳・コメント:**\n\n{st.session_state.ai_comment}")
 
 if st.button("💾 記録を保存する"):
     balance = food_kcal - (bmr + exercise_kcal)
@@ -127,6 +159,7 @@ if st.button("💾 記録を保存する"):
     st.success("🎉 記録を保存したで！")
     
     st.session_state.ai_kcal = 0
+    st.session_state.ai_comment = ""
     st.rerun()
 
 # --- 4. グラフ推移確認 ---
@@ -178,7 +211,7 @@ if not df.empty:
 else:
     st.info("💡 データを保存したら、ここにグラフが表示されるで！")
 
-# --- 5. 【新機能】日々の記録一覧テーブル ---
+# --- 5. 日々の記録一覧テーブル ---
 st.markdown("---")
 st.subheader("📋 過去の記録一覧")
 
