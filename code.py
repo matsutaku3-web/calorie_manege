@@ -1,33 +1,73 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import os
 import datetime
 from PIL import Image
+import json
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 # 💡 AIで画像を解析するためのライブラリ
 try:
     import google.generativeai as genai
 except ImportError:
-    st.error("ターミナルで `pip install google-generativeai` を実行してな！")
     genai = None
 
 st.set_page_config(page_title="AIカロリー管理ダッシュボード", layout="wide")
-st.title("📸 AIカロリー管理ダッシュボード 🏃‍♀️")
+st.title("📸 AIカロリー管理ダッシュボード（スプレッドシート連携版） 🏃‍♀️")
 
-CSV_FILE = "calorie_history.csv"
+# --- 1. Googleスプレッドシート接続設定 ---
+@st.cache_resource
+def init_gspread():
+    try:
+        # StreamlitのSecretsから認証情報を安全に取得
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        
+        if "gcp_service_account_json" in st.secrets:
+            # さっき登録したヒアドキュメント形式の場合
+            account_info = json.loads(st.secrets["gcp_service_account_json"])
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(account_info, scope)
+        else:
+            # 個別指定の場合のフォールバック
+            dict_creds = {
+                "type": "service_account",
+                "project_id": st.secrets["gcp_service_account"]["project_id"],
+                "private_key_id": st.secrets["gcp_service_account"]["private_key_id"],
+                "private_key": st.secrets["gcp_service_account"]["private_key"].replace('\\n', '\n'),
+                "client_email": st.secrets["gcp_service_account"]["client_email"],
+                "client_id": st.secrets["gcp_service_account"]["client_id"],
+                "auth_uri": st.secrets["gcp_service_account"]["auth_uri"],
+                "token_uri": st.secrets["gcp_service_account"]["token_uri"],
+                "auth_provider_x509_cert_url": st.secrets["gcp_service_account"]["auth_provider_x509_cert_url"],
+                "client_x509_cert_url": st.secrets["gcp_service_account"]["client_x509_cert_url"]
+            }
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(dict_creds, scope)
+            
+        client = gspread.authorize(creds)
+        spreadsheet_id = st.secrets["SPREADSHEET_ID"]
+        sheet = client.open_by_key(spreadsheet_id).sheet1
+        return sheet
+    except Exception as e:
+        st.error(f"スプレッドシートの接続に失敗したで: {e}")
+        return None
 
-# --- 1. データ読み込み ---
+sheet = init_gspread()
+
 def load_data():
-    if os.path.exists(CSV_FILE):
-        df = pd.read_csv(CSV_FILE)
-        if not df.empty and "日付" in df.columns:
+    if sheet is not None:
+        data = sheet.get_all_records()
+        df = pd.DataFrame(data)
+        columns = ["日付", "体重", "食べたもの", "摂取カロリー", "運動カロリー", "基礎代謝", "カロリー収支"]
+        if df.empty:
+            return pd.DataFrame(columns=columns)
+        for col in columns:
+            if col not in df.columns:
+                df[col] = ""
+        if "日付" in df.columns:
             df["日付"] = pd.to_datetime(df["日付"], format='mixed', errors='coerce')
-        if "食べたもの" not in df.columns:
-            df["食べたもの"] = ""
+        return df
     else:
-        df = pd.DataFrame(columns=["日付", "体重", "食べたもの", "摂取カロリー", "運動カロリー", "基礎代謝", "カロリー収支"])
-    return df
+        return pd.DataFrame(columns=["日付", "体重", "食べたもの", "摂取カロリー", "運動カロリー", "基礎代謝", "カロリー収支"])
 
 df = load_data()
 
@@ -55,19 +95,16 @@ col1, col2 = st.columns(2)
 with col1:
     record_date = st.date_input("日付", datetime.date.today())
     current_weight = st.number_input("今日の体重 (kg)", value=weight, step=0.1)
-    
     food_memo = st.text_input("食べたもの（例: 豚骨ラーメン、プロテインなど）", value="")
-    
     exercise_kcal = st.number_input("運動の消費カロリー (kcal) ※ランニングなど", value=0, step=10)
 
 with col2:
     st.write("🍔 食事の写真をアップロードしてAI推定！")
     
-    # 🔑 Streamlit CloudのSecretsから安全にAPIキーを取得（ローカルの場合は環境変数等にあわせて適宜）
     try:
         api_key = st.secrets["GEMINI_API_KEY"]
     except:
-        api_key = "AIzaSyDq3mHXQxUEI_-J2V4_0gkMWKh15vqC8kI" # 予備
+        api_key = ""
     
     uploaded_file = st.file_uploader("食事の写真を選ぶ", type=["jpg", "jpeg", "png"])
     
@@ -79,7 +116,7 @@ with col2:
     food_kcal = st.number_input("摂取カロリー (kcal)", value=st.session_state.ai_kcal, step=10)
 
     if uploaded_file is not None and st.button("✨ AIでカロリーを推定する"):
-        if genai:
+        if genai and api_key:
             try:
                 genai.configure(api_key=api_key)
                 model = genai.GenerativeModel('gemini-2.5-flash')
@@ -87,7 +124,6 @@ with col2:
                 st.image(image, width=300)
                 
                 with st.spinner("AIが食事を分析中..."):
-                    # 💡 変更：数字だけでなく、内訳の解説文もセットで返してもらうプロンプトに変更！
                     prompt = """
                     この食事の写真を見て、以下の2点を教えてください。
                     1. 推定される総摂取カロリーの数字（半角数字のみ、例: 800）
@@ -102,7 +138,6 @@ with col2:
                     response = model.generate_content([prompt, image])
                     text_res = response.text
                     
-                    # 応答をパース（分割）する処理
                     if "---CAL--" in text_res and "---COM--" in text_res:
                         parts = text_res.split("---COM--")
                         cal_part = parts[0].replace("---CAL--", "").strip()
@@ -112,7 +147,6 @@ with col2:
                         st.session_state.ai_kcal = estimated_kcal
                         st.session_state.ai_comment = comment_part
                     else:
-                        # 万が一形式が崩れた場合のフォールバック
                         estimated_kcal = int(''.join(filter(str.isdigit, text_res)))
                         st.session_state.ai_kcal = estimated_kcal
                         st.session_state.ai_comment = text_res
@@ -122,51 +156,53 @@ with col2:
             except Exception as e:
                 st.error(f"画像解析でエラーが出ちゃったわ: {e}")
 
-    # 💡 AIの解説コメントがある場合は画面に表示する
     if st.session_state.ai_comment:
         st.info(f"💡 **AIの判定内訳・コメント:**\n\n{st.session_state.ai_comment}")
 
 if st.button("💾 記録を保存する"):
     balance = food_kcal - (bmr + exercise_kcal)
-    
     date_str = pd.to_datetime(record_date).strftime('%Y-%m-%d')
     
-    new_record = pd.DataFrame([{
-        "日付": date_str,
-        "体重": current_weight,
-        "食べたもの": food_memo,
-        "摂取カロリー": food_kcal,
-        "運動カロリー": exercise_kcal,
-        "基礎代謝": bmr,
-        "カロリー収支": balance
-    }])
-    
-    columns_to_keep = ["日付", "体重", "食べたもの", "摂取カロリー", "運動カロリー", "基礎代謝", "カロリー収支"]
-    
-    if not df.empty:
-        df["日付_str"] = pd.to_datetime(df["日付"], format='mixed', errors='coerce').dt.strftime('%Y-%m-%d')
-        if date_str in df["日付_str"].values:
-            df.loc[df["日付_str"] == date_str, ["体重", "食べたもの", "摂取カロリー", "運動カロリー", "基礎代謝", "カロリー収支"]] = [current_weight, food_memo, food_kcal, exercise_kcal, bmr, balance]
-            save_df = df[columns_to_keep].copy()
-            save_df["日付"] = pd.to_datetime(save_df["日付"], format='mixed', errors='coerce').dt.strftime('%Y-%m-%d')
+    if sheet is not None:
+        # スプレッドシートに書き込み
+        records = sheet.get_all_records()
+        updated = False
+        
+        # ヘッダー行が空の場合の初期化対策
+        if not sheet.row_values(1):
+            sheet.append_row(["日付", "体重", "食べたもの", "摂取カロリー", "運動カロリー", "基礎代謝", "カロリー収支"])
+            
+        rows = sheet.get_all_values()
+        header = rows[0]
+        
+        # 既存の日付があれば上書き、なければ追加
+        row_to_update = None
+        for i, row in enumerate(rows[1:], start=2):
+            if len(row) > 0 and row[0] == date_str:
+                row_to_update = i
+                break
+                
+        new_row_data = [date_str, current_weight, food_memo, food_kcal, exercise_kcal, bmr, balance]
+        
+        if row_to_update:
+            # 既存行の更新 (gspreadは1始まり、headerが1行目なのでrow_to_updateがそのまま行番号)
+            for col_idx, val in enumerate(new_row_data, start=1):
+                sheet.update_cell(row_to_update, col_idx, val)
         else:
-            save_df = pd.concat([df[columns_to_keep], new_record], ignore_index=True)
-            save_df["日付"] = pd.to_datetime(save_df["日付"], format='mixed', errors='coerce').dt.strftime('%Y-%m-%d')
+            sheet.append_row(new_row_data)
+            
+        st.success("🎉 スプレッドシートに記録を保存したで！")
+        st.session_state.ai_kcal = 0
+        st.session_state.ai_comment = ""
+        st.rerun()
     else:
-        save_df = new_record
-
-    save_df.to_csv(CSV_FILE, index=False)
-    st.success("🎉 記録を保存したで！")
-    
-    st.session_state.ai_kcal = 0
-    st.session_state.ai_comment = ""
-    st.rerun()
+        st.error("スプレッドシートに接続されてへんから保存できへんかったわ！")
 
 # --- 4. グラフ推移確認 ---
 st.markdown("---")
 st.subheader("📈 グラフで推移を確認")
 
-if not df.empty:
+if not df.empty and "日付" in df.columns:
     df["日付"] = pd.to_datetime(df["日付"], format='mixed', errors='coerce')
     df = df.dropna(subset=["日付"]).sort_values("日付")
     
@@ -209,15 +245,15 @@ if not df.empty:
         fig_weight.update_xaxes(type='category')
         st.plotly_chart(fig_weight, width="stretch")
 else:
-    st.info("💡 データを保存したら、ここにグラフが表示されるで！")
+    st.info("💡 スプレッドシートにデータが入ったら、ここにグラフが表示されるで！")
 
 # --- 5. 日々の記録一覧テーブル ---
 st.markdown("---")
 st.subheader("📋 過去の記録一覧")
 
-if not df.empty:
+if not df.empty and "日付" in df.columns:
     display_df = df.copy()
-    display_df["日付"] = display_df["日付"].dt.strftime('%Y-%m-%d')
+    display_df["日付"] = pd.to_datetime(display_df["日付"], errors='coerce').dt.strftime('%Y-%m-%d')
     display_df = display_df.sort_values("日付", ascending=False)
     
     st.dataframe(
